@@ -28,6 +28,9 @@ class Settings:
     DIMSE_TIMEOUT: int = _int("DIMSE_TIMEOUT", 120)
     NETWORK_TIMEOUT: int = _int("NETWORK_TIMEOUT", 120)
 
+    # ---- SEG 核查上传上限（字节）----
+    MAX_SEG_BYTES: int = _int("MAX_SEG_BYTES", 64 * 1024 * 1024)
+
     # ---- 数据卷 ----
     DATA_DIR: Path = Path(os.getenv("DATA_DIR", "/data"))
     DB_PATH: Path = DATA_DIR / "retrieval.db"

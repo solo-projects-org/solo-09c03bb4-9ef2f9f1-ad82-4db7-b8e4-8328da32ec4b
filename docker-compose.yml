@@ -66,6 +66,10 @@ services:
       PACS_HOST: pacs
       PACS_PORT: "11112"
       APP_AET: RETRIEVER
+      # 虚构 SEG 样例目录（pacs 数据卷内，由 pacs 初始化时生成）
+      SEG_DIR: /pacs-data/seg
+    volumes:
+      - pacs-data:/pacs-data:ro
     depends_on:
       api:
         condition: service_healthy

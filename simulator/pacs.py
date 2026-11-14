@@ -67,10 +67,17 @@ class Registry:
             if not files:
                 continue
             probe = pydicom.dcmread(str(files[0]), stop_before_pixels=True)
+            # 只索引 CT；seg/ 等配套目录（Modality=SEG）跳过，
+            # 避免与同名 StudyInstanceUID 的 CT 检查冲突
+            if str(getattr(probe, "Modality", "")) != "CT":
+                log.info("跳过非 CT 目录：%s", study_dir.name)
+                continue
             study_uid = str(probe.StudyInstanceUID)
             instances = []
             for f in files:
                 meta = pydicom.dcmread(str(f), stop_before_pixels=True)
+                if str(getattr(meta, "SOPClassUID", "")) != str(CTImageStorage):
+                    continue
                 instances.append({
                     "sop_uid": str(meta.SOPInstanceUID),
                     "sop_class": str(meta.SOPClassUID),

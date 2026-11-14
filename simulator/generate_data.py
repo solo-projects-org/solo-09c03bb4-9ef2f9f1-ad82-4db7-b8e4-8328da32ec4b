@@ -141,6 +141,10 @@ def generate_study(
         "patient_id": patient_id,
         "patient_name": PATIENT_NAMES[study_index],
         "instances": instance_count,
+        "sop_instance_uids": [
+            _make_uid(3000 + study_index * 100 + i)
+            for i in range(1, instance_count + 1)
+        ],
         "directory": str(study_dir),
     }
 
@@ -156,12 +160,24 @@ def main() -> None:
 
     out_dir = Path(args.out)
     counts = [int(x) for x in args.counts.split(",")]
+    # 局部导入避免与 generate_seg 循环依赖
+    from .generate_seg import generate_seg_for_study
+
     manifest = []
     for idx, count in enumerate(counts, start=1):
         meta = generate_study(out_dir, idx, count)
+        seg_path = generate_seg_for_study(
+            out_dir,
+            meta["study_instance_uid"],
+            meta["sop_instance_uids"],
+            meta["patient_id"],
+            meta["patient_name"],
+        )
+        meta["seg_file"] = str(seg_path)
         manifest.append(meta)
         print(f"generated study {meta['study_instance_uid']} "
               f"({count} instances) -> {meta['directory']}")
+        print(f"generated fictional SEG -> {seg_path}")
 
     import json
     manifest_path = out_dir / "studies.json"

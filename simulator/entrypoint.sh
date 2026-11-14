@@ -14,5 +14,7 @@ if [ ! -f "$DATA_DIR/studies.json" ]; then
     python -m simulator.generate_data --out "$DATA_DIR" --counts "${STUDY_COUNTS:-8,6,5}"
 else
     echo "[pacs-init] 复用已有数据：$DATA_DIR/studies.json"
+    # 老数据卷补生成配套虚构 SEG（幂等，已存在则跳过）
+    python -m simulator.generate_seg --data-dir "$DATA_DIR"
 fi
 exec python -m simulator.pacs

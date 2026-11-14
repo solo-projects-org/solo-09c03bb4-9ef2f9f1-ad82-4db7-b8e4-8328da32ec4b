@@ -7,7 +7,8 @@
 3. 回传进行中投送“清单外实例”和“压缩实例”，验证均被拒收、不入包
 4. 提交一个 save_failure 批，验证保存失败即批失败、C-STORE 回失败码
 5. 轮询进度，下载完成批 ZIP 并校验实例数与清单一致
-6. 重启恢复演示：制造一个未完成批后调用进程退出，验证重启后该批判失败、
+6. 上传虚构多帧 BINARY SEG 核查标签覆盖；演示未知标签拒绝与失败批 409
+7. 重启恢复演示：制造一个未完成批后调用进程退出，验证重启后该批判失败、
    已完成批仍可下载
 
 运行::
@@ -23,6 +24,7 @@ import os
 import sys
 import time
 import zipfile
+from pathlib import Path
 
 import requests
 
@@ -153,11 +155,60 @@ def main() -> int:
     print(f"    失败批 C 下载 HTTP 状态={denied.status_code}（期望 409）")
     assert denied.status_code == 409
 
+    banner("7. SEG 核查：上传虚构多帧 BINARY SEG，核对各标签覆盖的切片")
+    seg_dir = Path(os.getenv("SEG_DIR", "/pacs-data/seg"))
+    seg_file = seg_dir / f"{study_a}.dcm"
+    if view_a["state"] != "COMPLETED" or not seg_file.exists():
+        print(f"    批 A 未完成或未找到虚构 SEG 样例 {seg_file}，跳过 SEG 演示")
+    else:
+        seg_bytes = seg_file.read_bytes()
+        r = requests.post(f"{API}/batches/{batch_a}/seg-check",
+                          files={"file": ("seg.dcm", seg_bytes,
+                                          "application/dicom")},
+                          timeout=30)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        stats = body["stats"]
+        print(f"    核查通过：{stats['frames_total']} 帧（空掩膜 "
+              f"{stats['frames_empty_mask']}、重复 {stats['frames_duplicate']}），"
+              f"批内共 {stats['batch_instances']} 个已登记 CT")
+        for lab in body["labels"]:
+            print(f"    标签 {lab['segment_number']}({lab['label']})："
+                  f"已标注 {lab['annotated_count']} 层，"
+                  f"未标注 {lab['unannotated_count']} 层")
+            shown = lab["annotated_sops"][:2]
+            suffix = " ..." if lab["annotated_count"] > 2 else ""
+            print(f"      已标注 SOP 示例：{shown}{suffix}")
+
+        banner("8. 异常 SEG：未知标签必须指出帧号并拒绝完整结论")
+        import pydicom
+        bad = pydicom.dcmread(str(seg_file))
+        bad.PerFrameFunctionalGroupsSequence[0] \
+            .SegmentIdentificationSequence[0].ReferencedSegmentNumber = 99
+        buf = io.BytesIO()
+        bad.save_as(buf, enforce_file_format=True)
+        r = requests.post(f"{API}/batches/{batch_a}/seg-check",
+                          files={"file": ("bad-seg.dcm", buf.getvalue(),
+                                          "application/dicom")},
+                          timeout=30)
+        assert r.status_code == 422, r.text
+        err = r.json()["frame_errors"][0]
+        print(f"    拒绝完整结论（HTTP 422）：帧 {err['frame_number']} "
+              f"{err['kind']}：{err['message']}")
+
+        banner("9. 失败批不可核查（HTTP 409）")
+        r = requests.post(f"{API}/batches/{batch_c}/seg-check",
+                          files={"file": ("seg.dcm", seg_bytes,
+                                          "application/dicom")},
+                          timeout=30)
+        print(f"    失败批 C 上传 SEG HTTP 状态={r.status_code}（期望 409）")
+        assert r.status_code == 409
+
     if args.skip_restart:
         banner("演示完成（已跳过重启恢复）")
         return 0
 
-    banner("7. 重启恢复：制造未完成批后重启进程")
+    banner("10. 重启恢复：制造未完成批后重启进程")
     # 再提交一个新检查的批，立刻杀掉进程，使其停在非终态。
     # 终态批已存在不影响重新提交（仅拒绝“进行中”的同 Study 批）。
     r_d = requests.post(f"{API}/batches",

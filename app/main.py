@@ -7,11 +7,12 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from . import dicom, storage
+from . import dicom, segcheck, storage
 from .config import settings
 from .db import (
     STATE_COMPLETED,
@@ -53,13 +54,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DICOM CT 离线取数流水线",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "提交 StudyInstanceUID → C-FIND 固定 SOP 清单 → C-MOVE 回传 → "
         "C-STORE 接收非压缩 CT → 核对收齐后打包 ZIP 下载。\n\n"
         "规则：清单外实例不入包、重复实例不重复计数、保存失败即批失败、"
-        "失败批迟到回传不可恢复、重启后未完成批判失败。"
+        "失败批迟到回传不可恢复、重启后未完成批判失败。\n\n"
+        "SEG 核查：对 COMPLETED 批上传未压缩多帧 BINARY SEG，按每帧 "
+        "SegmentNumber / DerivationImageSequence 源 SOP / 解码掩膜，输出各标签"
+        "已标注与未标注切片清单；未知标签、缺失或歧义引用、行列不匹配、"
+        "像素解码失败、核查期间源文件丢失或被替换，均拒绝给出完整结论。"
     ),
 )
 
@@ -183,6 +188,129 @@ def download_zip(batch_id: str) -> FileResponse:
         path, media_type="application/zip",
         filename=f"{batch_id}.zip",
     )
+
+
+# ------------------------------------------------------------------ SEG 核查
+class FrameErrorView(BaseModel):
+    frame_number: int = Field(..., description="帧号（1 起）")
+    kind: str = Field(..., description="错误类别，如 UNKNOWN_SEGMENT")
+    message: str
+
+
+class SourceProblemView(BaseModel):
+    kind: str = Field(..., description="SOURCE_FILE_MISSING / SOURCE_FILE_CHANGED")
+    sop_instance_uid: str
+    message: str
+
+
+class LabelCoverageView(BaseModel):
+    segment_number: int
+    label: str
+    annotated_count: int
+    unannotated_count: int
+    annotated_sops: list[str] = Field(..., description="该标签已标注的本批 SOP 清单")
+    unannotated_sops: list[str] = Field(..., description="该标签未标注的本批 SOP 清单")
+
+
+class SegInfoView(BaseModel):
+    sop_instance_uid: str
+    segmentation_type: str
+    number_of_frames: int
+    rows: int
+    columns: int
+    transfer_syntax: str
+
+
+class SegCheckView(BaseModel):
+    batch_id: str
+    complete: bool = Field(..., description="结论是否完整；false 时 labels 为空")
+    seg: SegInfoView
+    stats: dict[str, int]
+    labels: list[LabelCoverageView]
+    frame_errors: list[FrameErrorView]
+    source_problems: list[SourceProblemView]
+
+
+def _seg_check_view(batch_id: str, result: segcheck.SegCheckResult) -> SegCheckView:
+    return SegCheckView(
+        batch_id=batch_id,
+        complete=result.complete,
+        seg=SegInfoView(**result.seg_info),
+        stats=result.stats,
+        labels=[
+            LabelCoverageView(
+                segment_number=c.segment_number,
+                label=c.label,
+                annotated_count=len(c.annotated_sops),
+                unannotated_count=len(c.unannotated_sops),
+                annotated_sops=c.annotated_sops,
+                unannotated_sops=c.unannotated_sops,
+            )
+            for c in result.labels
+        ],
+        frame_errors=[FrameErrorView(**vars(e)) for e in result.frame_errors],
+        source_problems=[SourceProblemView(**vars(p)) for p in result.source_problems],
+    )
+
+
+@app.post(
+    "/batches/{batch_id}/seg-check",
+    response_model=SegCheckView,
+    tags=["seg-check"],
+    summary="上传未压缩多帧 BINARY SEG，核查各标签覆盖的本批 CT 切片",
+    responses={
+        200: {"description": "核查通过，labels 给出各标签已标注/未标注 SOP 完整清单"},
+        400: {"description": "SEG 结构不合法（非 SEG / 压缩 / 非多帧 / 非 BINARY / 缺关键序列）"},
+        404: {"description": "批不存在"},
+        409: {"description": "批非 COMPLETED，或核查期间源文件丢失/被替换"},
+        413: {"description": "SEG 文件超过大小上限"},
+        422: {"description": "帧级错误（未知标签 / 缺失或歧义引用 / 行列不匹配 / 像素解码失败），拒绝完整结论"},
+    },
+)
+async def seg_check(
+    batch_id: str,
+    file: UploadFile = File(..., description="未压缩、多帧、BINARY 的 SEG 文件"),
+):
+    row = db.get_batch(batch_id)
+    if row is None:
+        raise HTTPException(404, "批不存在")
+    if row["state"] != STATE_COMPLETED:
+        raise HTTPException(
+            409, f"批状态 {row['state']} 不可核查；仅 COMPLETED 批可核查")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "上传文件为空")
+    if len(data) > settings.MAX_SEG_BYTES:
+        raise HTTPException(
+            413, f"SEG 文件超过 {settings.MAX_SEG_BYTES} 字节上限")
+    try:
+        result = await run_in_threadpool(segcheck.verify_seg, db, batch_id, data)
+    except segcheck.SegStructureError as exc:
+        db.add_event("SEG_CHECK_REJECTED", f"SEG 结构不合法：{exc}", batch_id)
+        raise HTTPException(400, f"SEG 结构不合法：{exc}") from exc
+
+    view = _seg_check_view(batch_id, result)
+    if result.complete:
+        db.add_event(
+            "SEG_CHECK_COMPLETE",
+            f"SEG 核查通过：{result.stats['frames_total']} 帧、"
+            f"{result.stats['segments']} 个标签，覆盖结论完整",
+            batch_id,
+        )
+        return view
+    if result.source_problems:
+        db.add_event(
+            "SEG_CHECK_SOURCE_UNSTABLE",
+            f"核查期间源文件异常 {len(result.source_problems)} 项，不能报完整",
+            batch_id,
+        )
+        return JSONResponse(view.model_dump(), status_code=409)
+    db.add_event(
+        "SEG_CHECK_REJECTED",
+        f"SEG 帧级错误 {len(result.frame_errors)} 处，拒绝完整结论",
+        batch_id,
+    )
+    return JSONResponse(view.model_dump(), status_code=422)
 
 
 @app.get("/health", tags=["system"], summary="健康检查")

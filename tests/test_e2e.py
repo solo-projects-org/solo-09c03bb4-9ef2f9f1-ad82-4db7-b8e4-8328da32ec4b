@@ -540,3 +540,156 @@ def test_09_restart_recovery(env_stack):
         assert dl.status_code == 200
     finally:
         pass
+
+
+# =============================================================== SEG 核查
+def _seg_upload(stack, batch_id, seg_bytes, name="seg.dcm"):
+    return requests.post(
+        f"{stack['base']}/batches/{batch_id}/seg-check",
+        files={"file": (name, seg_bytes, "application/dicom")}, timeout=30)
+
+
+def _make_seg_bytes(frames, study_uid, segments=None, rows=64, cols=64):
+    import io
+    from simulator.generate_seg import build_seg_dataset
+
+    ds = build_seg_dataset(
+        study_uid=study_uid, frames=frames, segments=segments,
+        rows=rows, cols=cols, seg_sop_uid="9.8.7.6.5.1",
+        seg_series_uid="9.8.7.6.5.2")
+    buf = io.BytesIO()
+    ds.save_as(buf, enforce_file_format=True)
+    return buf.getvalue()
+
+
+def _completed_batch(stack, study_uid, fault=""):
+    r = requests.post(f"{stack['base']}/batches",
+                      json={"study_instance_uid": study_uid,
+                            "fault_inject": fault}, timeout=10)
+    assert r.status_code == 201, r.text
+    bid = r.json()["id"]
+    view = _wait_terminal(stack, bid)
+    return bid, view
+
+
+def test_10_seg_check_complete_coverage(env_stack):
+    """完整结论：各标签已标注/未标注清单、空掩膜不计、重复帧去重。"""
+    from simulator.generate_seg import circle_bits, ellipse_bits
+
+    studies = _studies(env_stack)
+    study = studies[0]["study_instance_uid"]
+    bid, view = _completed_batch(env_stack, study)
+    assert view["state"] == "COMPLETED"
+    sops = requests.get(f"{env_stack['base']}/batches/{bid}/instances",
+                        timeout=5).json()["manifest"]
+
+    frames = [
+        (1, sops[0], circle_bits(64, 64, 32, 32, 6)),
+        (1, sops[1], circle_bits(64, 64, 30, 30, 5)),
+        (2, sops[1], ellipse_bits(64, 64, 32, 32, 12, 7)),
+        (1, sops[2], None),                              # 空掩膜不计
+        (1, sops[0], circle_bits(64, 64, 10, 10, 3)),    # 重复只计一次
+    ]
+    r = _seg_upload(env_stack, bid, _make_seg_bytes(frames, study))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["complete"] is True
+    assert body["frame_errors"] == [] and body["source_problems"] == []
+    labels = {l["segment_number"]: l for l in body["labels"]}
+    assert labels[1]["label"] == "NODULE"
+    assert labels[1]["annotated_sops"] == sorted([sops[0], sops[1]])
+    assert labels[1]["unannotated_sops"] == sorted(sops[2:])
+    assert labels[2]["annotated_sops"] == [sops[1]]
+    assert labels[2]["unannotated_sops"] == sorted(
+        [s for s in sops if s != sops[1]])
+    assert body["stats"]["frames_empty_mask"] == 1
+    assert body["stats"]["frames_duplicate"] == 1
+    assert body["seg"]["segmentation_type"] == "BINARY"
+
+    # 事件流水可见核查记录
+    kinds = [e["kind"] for e in requests.get(
+        f"{env_stack['base']}/batches/{bid}/events", timeout=5).json()]
+    assert "SEG_CHECK_COMPLETE" in kinds
+
+
+def test_11_seg_check_frame_errors_point_to_frame_numbers(env_stack):
+    """未知标签 / 缺失引用 / 歧义引用：指出帧号并拒绝完整结论（422）。"""
+    from simulator.generate_seg import circle_bits
+
+    studies = _studies(env_stack)
+    study = studies[1]["study_instance_uid"]
+    bid, view = _completed_batch(env_stack, study)
+    assert view["state"] == "COMPLETED"
+    sops = requests.get(f"{env_stack['base']}/batches/{bid}/instances",
+                        timeout=5).json()["manifest"]
+    circle = circle_bits(64, 64, 32, 32, 5)
+
+    # 未知标签：第 2 帧引用标签表外的 SegmentNumber=99
+    r = _seg_upload(env_stack, bid, _make_seg_bytes(
+        [(1, sops[0], circle), (99, sops[1], circle)], study))
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["complete"] is False and body["labels"] == []
+    assert [(e["frame_number"], e["kind"]) for e in body["frame_errors"]] == [
+        (2, "UNKNOWN_SEGMENT")]
+
+    # 缺失引用：第 1 帧引用清单外 SOP；第 2 帧无 DerivationImageSequence
+    r = _seg_upload(env_stack, bid, _make_seg_bytes(
+        [(1, "1.2.3.4.5.6.7.8.9", circle), (1, None, circle)], study))
+    assert r.status_code == 422
+    assert [(e["frame_number"], e["kind"])
+            for e in r.json()["frame_errors"]] == [
+        (1, "MISSING_REFERENCE"), (2, "MISSING_REFERENCE")]
+
+    # 歧义引用：第 2 帧引用两个不同源 SOP
+    r = _seg_upload(env_stack, bid, _make_seg_bytes(
+        [(1, sops[0], circle), (1, [sops[0], sops[1]], circle)], study))
+    assert r.status_code == 422
+    assert [(e["frame_number"], e["kind"])
+            for e in r.json()["frame_errors"]] == [(2, "AMBIGUOUS_REFERENCE")]
+
+    # 行列不匹配：32x32 的 SEG 对应 64x64 的 CT
+    small = _make_seg_bytes(
+        [(1, sops[0], circle_bits(32, 32, 16, 16, 4)),
+         (1, sops[1], circle_bits(32, 32, 16, 16, 4))],
+        study, rows=32, cols=32)
+    r = _seg_upload(env_stack, bid, small)
+    assert r.status_code == 422
+    assert {e["kind"] for e in r.json()["frame_errors"]} == {
+        "DIMENSION_MISMATCH"}
+    assert [e["frame_number"] for e in r.json()["frame_errors"]] == [1, 2]
+
+
+def test_12_seg_check_structure_and_state_guards(env_stack):
+    """结构不合法 400、批不存在 404、批非 COMPLETED 409。"""
+    from simulator.generate_seg import circle_bits
+
+    studies = _studies(env_stack)
+    study = studies[2]["study_instance_uid"]
+
+    # 非 DICOM 内容 -> 400
+    bid, view = _completed_batch(env_stack, study)
+    assert view["state"] == "COMPLETED"
+    r = _seg_upload(env_stack, bid, b"definitely not dicom", "bad.dcm")
+    assert r.status_code == 400
+
+    # 上传 CT 图像而非 SEG -> 400
+    ct_path = sorted((env_stack["pacs_data"] / study).glob("*.dcm"))[0]
+    r = _seg_upload(env_stack, bid, ct_path.read_bytes(), "ct.dcm")
+    assert r.status_code == 400
+
+    # 批不存在 -> 404
+    r = _seg_upload(env_stack, "no-such-batch", b"x")
+    assert r.status_code == 404
+
+    # 失败批 -> 409（SEG 本身合法也不行）
+    bid2, view2 = _completed_batch(env_stack, study, fault="save_failure")
+    assert view2["state"] == "FAILED"
+    sops = requests.get(f"{env_stack['base']}/batches/{bid}/instances",
+                        timeout=5).json()["manifest"]
+    good = _make_seg_bytes(
+        [(1, sops[0], circle_bits(64, 64, 32, 32, 5)),
+         (2, sops[1], circle_bits(64, 64, 32, 32, 5))],
+        study)
+    r = _seg_upload(env_stack, bid2, good)
+    assert r.status_code == 409
